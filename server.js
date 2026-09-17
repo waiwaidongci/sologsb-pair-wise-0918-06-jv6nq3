@@ -39,7 +39,8 @@ const initialData = {
       qualified: false,
       note: "仍偏快，振幅尚可"
     }
-  ]
+  ],
+  seals: []
 };
 
 const routes = [
@@ -47,12 +48,16 @@ const routes = [
   "GET /clocks",
   "POST /clocks",
   "GET /clocks/not-qualified",
+  "GET /clocks/:id",
   "GET /clocks/:id/history",
   "POST /clocks/:id/adjustments",
   "POST /clocks/:id/retests",
   "GET /clocks/:id/latest-retest",
+  "POST /clocks/:id/seals",
+  "GET /clocks/:id/seals",
   "GET /adjustments",
-  "GET /retests"
+  "GET /retests",
+  "GET /seals"
 ];
 
 async function ensureDb() {
@@ -66,7 +71,13 @@ async function ensureDb() {
 
 async function readDb() {
   await ensureDb();
-  return JSON.parse(await readFile(DB_FILE, "utf8"));
+  const db = JSON.parse(await readFile(DB_FILE, "utf8"));
+  // 兼容旧数据文件：补齐封签集合等数组
+  db.clocks ??= [];
+  db.adjustments ??= [];
+  db.retests ??= [];
+  db.seals ??= [];
+  return db;
 }
 
 async function writeDb(data) {
@@ -126,15 +137,116 @@ function latestAdjustment(db, clockId) {
     .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0] || null;
 }
 
-function clockSummary(db, clock) {
-  const retest = latestRetest(db, clock.id);
+function activeSeal(db, clockId) {
+  return db.seals
+    .filter((item) => item.clockId === clockId && item.status === "valid")
+    .sort((a, b) => new Date(b.sealedAt) - new Date(a.sealedAt))[0] || null;
+}
+
+function sealHistory(db, clockId) {
+  return db.seals
+    .filter((item) => item.clockId === clockId)
+    .sort((a, b) => new Date(b.sealedAt) - new Date(a.sealedAt));
+}
+
+// 封存交付的唯一结论来源：列表、历史、详情都通过它得出一致结论
+function clockConclusion(db, clock) {
   const adjustment = latestAdjustment(db, clock.id);
+  const retest = latestRetest(db, clock.id);
+  const seal = activeSeal(db, clock.id);
+
+  const target = Number(clock.targetDailyRateSeconds);
+  const hasRate = retest && Number.isFinite(Number(retest.dailyRateSeconds));
+  const hasAmplitude = retest && Number.isFinite(Number(retest.amplitude));
+  const rateWithinTarget = hasRate && Math.abs(Number(retest.dailyRateSeconds)) <= target;
+  const amplitudeWithinRange = hasAmplitude && Number(retest.amplitude) >= 180 && Number(retest.amplitude) <= 320;
+  const retestAfterAdjustment =
+    retest && (!adjustment || new Date(retest.testedAt) >= new Date(adjustment.createdAt));
+
+  const retestMeetsCriteria = Boolean(
+    retest && retestAfterAdjustment && rateWithinTarget && amplitudeWithinRange
+  );
+
+  let status;
+  let statusReason;
+  if (seal) {
+    status = "sealed";
+    statusReason = "已封存交付";
+  } else if (!adjustment) {
+    status = "unadjusted";
+    statusReason = "尚未调校";
+  } else if (!retest || !retestAfterAdjustment) {
+    status = "pending-retest";
+    statusReason = "最新调校后尚无复测结果";
+  } else if (!retestMeetsCriteria) {
+    status = "not-qualified";
+    const reasons = [];
+    if (!rateWithinTarget) reasons.push(`复测日差绝对值${Math.abs(Number(retest.dailyRateSeconds))}秒超过目标${target}秒`);
+    if (!amplitudeWithinRange) reasons.push(`振幅${Number(retest.amplitude)}度不在180-320范围内`);
+    statusReason = reasons.join("；");
+  } else {
+    status = "qualified";
+    statusReason = "复测合格，可封存交付";
+  }
+
   return {
-    ...clock,
+    status,
+    statusReason,
+    sealed: Boolean(seal),
+    activeSeal: seal,
+    qualified: status === "sealed" || status === "qualified",
+    retestMeetsCriteria,
+    rateWithinTarget: Boolean(rateWithinTarget),
+    amplitudeWithinRange: Boolean(amplitudeWithinRange),
+    retestAfterLatestAdjustment: Boolean(retestAfterAdjustment),
     latestAdjustment: adjustment,
-    latestRetest: retest,
-    qualified: retest ? retest.qualified : false
+    latestRetest: retest
   };
+}
+
+function clockSummary(db, clock) {
+  return { ...clock, ...clockConclusion(db, clock) };
+}
+
+// 封存前置条件：仅以当前最新调校后的最新复测为准
+function assertSealable(db, clock) {
+  const conclusion = clockConclusion(db, clock);
+  const adjustment = conclusion.latestAdjustment;
+  const retest = conclusion.latestRetest;
+
+  if (conclusion.activeSeal) {
+    const error = new Error(`该钟表已封存（封签 ${conclusion.activeSeal.sealTag}），再次调校后才能重新封存`);
+    error.status = 409;
+    throw error;
+  }
+  if (!adjustment) {
+    const error = new Error("尚未调校，无法封存");
+    error.status = 400;
+    throw error;
+  }
+  if (!retest) {
+    const error = new Error("调校后尚无复测记录，无法封存");
+    error.status = 400;
+    throw error;
+  }
+  if (!conclusion.retestAfterLatestAdjustment) {
+    const error = new Error("最新调校后尚未复测，无法封存");
+    error.status = 400;
+    throw error;
+  }
+  if (!conclusion.rateWithinTarget) {
+    const error = new Error(
+      `最新复测日差绝对值${Math.abs(Number(retest.dailyRateSeconds))}秒超过目标${Number(clock.targetDailyRateSeconds)}秒，无法封存`
+    );
+    error.status = 400;
+    throw error;
+  }
+  if (!conclusion.amplitudeWithinRange) {
+    const error = new Error(`最新复测振幅${Number(retest.amplitude)}度不在180-320范围内，无法封存`);
+    error.status = 400;
+    throw error;
+  }
+  return conclusion;
 }
 
 async function handle(req, res) {
@@ -148,10 +260,15 @@ async function handle(req, res) {
 
   if (req.method === "GET" && pathname === "/clocks") {
     const qualified = url.searchParams.get("qualified");
+    const sealed = url.searchParams.get("sealed");
     let data = db.clocks.map((clock) => clockSummary(db, clock));
     if (qualified !== null) {
       const expected = qualified === "true";
       data = data.filter((clock) => clock.qualified === expected);
+    }
+    if (sealed !== null) {
+      const expected = sealed === "true";
+      data = data.filter((clock) => clock.sealed === expected);
     }
     return send(res, 200, { data });
   }
@@ -178,12 +295,34 @@ async function handle(req, res) {
     return send(res, 200, { data });
   }
 
+  const clockDetailMatch = pathname.match(/^\/clocks\/([^/]+)$/);
+  if (clockDetailMatch && req.method === "GET") {
+    const clock = findClock(db, clockDetailMatch[1]);
+    return send(res, 200, { data: clockSummary(db, clock) });
+  }
+
   const historyMatch = pathname.match(/^\/clocks\/([^/]+)\/history$/);
   if (historyMatch && req.method === "GET") {
     const clock = findClock(db, historyMatch[1]);
     const adjustments = db.adjustments.filter((item) => item.clockId === clock.id);
     const retests = db.retests.filter((item) => item.clockId === clock.id);
-    return send(res, 200, { data: { clock, adjustments, retests, latestRetest: latestRetest(db, clock.id) } });
+    const seals = sealHistory(db, clock.id);
+    // 结论与列表、详情完全一致
+    const summary = clockSummary(db, clock);
+    return send(res, 200, {
+      data: {
+        clock: summary,
+        adjustments,
+        retests,
+        seals,
+        status: summary.status,
+        statusReason: summary.statusReason,
+        sealed: summary.sealed,
+        activeSeal: summary.activeSeal,
+        qualified: summary.qualified,
+        latestRetest: summary.latestRetest
+      }
+    });
   }
 
   const adjustmentMatch = pathname.match(/^\/clocks\/([^/]+)\/adjustments$/);
@@ -201,8 +340,25 @@ async function handle(req, res) {
       createdAt: new Date().toISOString()
     };
     db.adjustments.push(adjustment);
+
+    // 封存后再次调校：封存立即失效，钟表回到待复测；旧封存保留可查
+    const invalidatedSealIds = [];
+    for (const seal of db.seals) {
+      if (seal.clockId === clock.id && seal.status === "valid") {
+        seal.status = "invalidated";
+        seal.invalidatedAt = adjustment.createdAt;
+        seal.invalidatedByAdjustmentId = adjustment.id;
+        seal.invalidateReason = "封存后再次调校，封存自动失效，回到待复测";
+        invalidatedSealIds.push(seal.id);
+      }
+    }
+
     await writeDb(db);
-    return send(res, 201, { data: adjustment });
+    return send(res, 201, {
+      data: adjustment,
+      invalidatedSealIds,
+      clock: clockSummary(db, clock)
+    });
   }
 
   const retestMatch = pathname.match(/^\/clocks\/([^/]+)\/retests$/);
@@ -235,6 +391,67 @@ async function handle(req, res) {
     return send(res, 200, { data: latestRetest(db, latestMatch[1]) });
   }
 
+  const sealMatch = pathname.match(/^\/clocks\/([^/]+)\/seals$/);
+  if (sealMatch && req.method === "POST") {
+    const clock = findClock(db, sealMatch[1]);
+    const body = await parseBody(req);
+    required(body, ["sealTag", "deliveredBy"]);
+    const sealTag = String(body.sealTag).trim();
+    const deliveredBy = String(body.deliveredBy).trim();
+    if (!sealTag) {
+      const error = new Error("缺少字段：sealTag");
+      error.status = 400;
+      throw error;
+    }
+    if (!deliveredBy) {
+      const error = new Error("缺少字段：deliveredBy");
+      error.status = 400;
+      throw error;
+    }
+
+    // 资格不满足直接拒绝，不产生任何写入
+    const conclusion = assertSealable(db, clock);
+
+    // 封签全局唯一：重复返回409且不写入
+    const duplicated = db.seals.some((item) => item.sealTag === sealTag);
+    if (duplicated) {
+      const error = new Error(`封签 ${sealTag} 已存在，封签必须唯一`);
+      error.status = 409;
+      throw error;
+    }
+
+    const retest = conclusion.latestRetest;
+    const sealedAt = new Date().toISOString();
+    const seal = {
+      id: makeId("seal"),
+      clockId: clock.id,
+      sealTag,
+      deliveredBy,
+      status: "valid",
+      sealedAt,
+      retestId: retest.id,
+      adjustmentId: conclusion.latestAdjustment.id,
+      note: body.note || "",
+      // 封存时刻的复测快照，作为交付凭证固定下来
+      snapshot: {
+        targetDailyRateSeconds: Number(clock.targetDailyRateSeconds),
+        dailyRateSeconds: Number(retest.dailyRateSeconds),
+        amplitude: Number(retest.amplitude)
+      }
+    };
+    db.seals.push(seal);
+    await writeDb(db);
+    return send(res, 201, { data: seal, clock: clockSummary(db, clock) });
+  }
+
+  if (sealMatch && req.method === "GET") {
+    const clock = findClock(db, sealMatch[1]);
+    const status = url.searchParams.get("status");
+    let seals = sealHistory(db, clock.id);
+    if (status !== null) seals = seals.filter((item) => item.status === status);
+    return send(res, 200, { data: seals, activeSeal: activeSeal(db, clock.id) });
+  }
+
   if (req.method === "GET" && pathname === "/adjustments") {
     const clockId = url.searchParams.get("clockId");
     return send(res, 200, { data: db.adjustments.filter((item) => !clockId || item.clockId === clockId) });
@@ -248,6 +465,18 @@ async function handle(req, res) {
       const matchQualified = qualified === null || item.qualified === (qualified === "true");
       return matchClock && matchQualified;
     });
+    return send(res, 200, { data });
+  }
+
+  if (req.method === "GET" && pathname === "/seals") {
+    const clockId = url.searchParams.get("clockId");
+    const status = url.searchParams.get("status");
+    const sealed = url.searchParams.get("sealed");
+    let data = db.seals.filter((item) => !clockId || item.clockId === clockId);
+    if (status !== null) data = data.filter((item) => item.status === status);
+    // sealed=true 仅返回当前有效封签，与 /clocks?sealed=true 口径一致
+    if (sealed !== null) data = data.filter((item) => (item.status === "valid") === (sealed === "true"));
+    data = data.sort((a, b) => new Date(b.sealedAt) - new Date(a.sealedAt));
     return send(res, 200, { data });
   }
 
