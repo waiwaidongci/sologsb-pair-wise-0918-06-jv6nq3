@@ -39,7 +39,8 @@ const initialData = {
       qualified: false,
       note: "仍偏快，振幅尚可"
     }
-  ]
+  ],
+  seals: []
 };
 
 const routes = [
@@ -47,13 +48,19 @@ const routes = [
   "GET /clocks",
   "POST /clocks",
   "GET /clocks/not-qualified",
+  "GET /clocks/:id",
   "GET /clocks/:id/history",
   "POST /clocks/:id/adjustments",
   "POST /clocks/:id/retests",
+  "POST /clocks/:id/seal",
   "GET /clocks/:id/latest-retest",
   "GET /adjustments",
-  "GET /retests"
+  "GET /retests",
+  "GET /seals"
 ];
+
+const AMPLITUDE_MIN = 180;
+const AMPLITUDE_MAX = 320;
 
 async function ensureDb() {
   await mkdir(path.dirname(DB_FILE), { recursive: true });
@@ -66,7 +73,12 @@ async function ensureDb() {
 
 async function readDb() {
   await ensureDb();
-  return JSON.parse(await readFile(DB_FILE, "utf8"));
+  const db = JSON.parse(await readFile(DB_FILE, "utf8"));
+  db.clocks = db.clocks || [];
+  db.adjustments = db.adjustments || [];
+  db.retests = db.retests || [];
+  db.seals = db.seals || [];
+  return db;
 }
 
 async function writeDb(data) {
@@ -126,14 +138,45 @@ function latestAdjustment(db, clockId) {
     .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0] || null;
 }
 
+function activeSeal(db, clockId) {
+  return db.seals.find((item) => item.clockId === clockId && item.status === "active") || null;
+}
+
+// 最新复测是否覆盖当前最新调校：复测时间不早于调校时间，或复测显式关联该调校
+function retestCoversAdjustment(retest, adjustment) {
+  if (!retest) return false;
+  if (!adjustment) return true;
+  return retest.adjustmentId === adjustment.id || new Date(retest.testedAt) >= new Date(adjustment.createdAt);
+}
+
+// 封存门槛：当前调校后的最新复测，日差绝对值不超目标且振幅在 180–320
+function sealEligibility(db, clock) {
+  const adjustment = latestAdjustment(db, clock.id);
+  const retest = latestRetest(db, clock.id);
+  if (!retestCoversAdjustment(retest, adjustment)) {
+    return { ok: false, reason: "pending_retest", retest, adjustment };
+  }
+  const rateOk = Math.abs(Number(retest.dailyRateSeconds)) <= Number(clock.targetDailyRateSeconds);
+  const amplitudeOk = Number(retest.amplitude) >= AMPLITUDE_MIN && Number(retest.amplitude) <= AMPLITUDE_MAX;
+  return { ok: rateOk && amplitudeOk, reason: rateOk && amplitudeOk ? null : "retest_not_qualified", retest, adjustment, rateOk, amplitudeOk };
+}
+
 function clockSummary(db, clock) {
   const retest = latestRetest(db, clock.id);
   const adjustment = latestAdjustment(db, clock.id);
+  const seal = activeSeal(db, clock.id);
+  const covered = retestCoversAdjustment(retest, adjustment);
+  const qualified = covered && retest ? Boolean(retest.qualified) : false;
+  const status = seal ? "sealed" : !covered ? "pending_retest" : qualified ? "qualified" : "unqualified";
   return {
     ...clock,
     latestAdjustment: adjustment,
     latestRetest: retest,
-    qualified: retest ? retest.qualified : false
+    qualified,
+    sealed: Boolean(seal),
+    activeSeal: seal,
+    sealable: !seal && sealEligibility(db, clock).ok,
+    status
   };
 }
 
@@ -148,10 +191,15 @@ async function handle(req, res) {
 
   if (req.method === "GET" && pathname === "/clocks") {
     const qualified = url.searchParams.get("qualified");
+    const sealed = url.searchParams.get("sealed");
     let data = db.clocks.map((clock) => clockSummary(db, clock));
     if (qualified !== null) {
       const expected = qualified === "true";
       data = data.filter((clock) => clock.qualified === expected);
+    }
+    if (sealed !== null) {
+      const expected = sealed === "true";
+      data = data.filter((clock) => clock.sealed === expected);
     }
     return send(res, 200, { data });
   }
@@ -183,7 +231,10 @@ async function handle(req, res) {
     const clock = findClock(db, historyMatch[1]);
     const adjustments = db.adjustments.filter((item) => item.clockId === clock.id);
     const retests = db.retests.filter((item) => item.clockId === clock.id);
-    return send(res, 200, { data: { clock, adjustments, retests, latestRetest: latestRetest(db, clock.id) } });
+    const seals = db.seals
+      .filter((item) => item.clockId === clock.id)
+      .sort((a, b) => new Date(b.sealedAt) - new Date(a.sealedAt));
+    return send(res, 200, { data: { clock: clockSummary(db, clock), adjustments, retests, seals, latestRetest: latestRetest(db, clock.id) } });
   }
 
   const adjustmentMatch = pathname.match(/^\/clocks\/([^/]+)\/adjustments$/);
@@ -201,8 +252,15 @@ async function handle(req, res) {
       createdAt: new Date().toISOString()
     };
     db.adjustments.push(adjustment);
+    // 再次调校立即使当前封存失效，钟表回到待复测；旧封存保留可查
+    const seal = activeSeal(db, clock.id);
+    if (seal) {
+      seal.status = "invalidated";
+      seal.invalidatedAt = adjustment.createdAt;
+      seal.invalidatedByAdjustmentId = adjustment.id;
+    }
     await writeDb(db);
-    return send(res, 201, { data: adjustment });
+    return send(res, 201, { data: adjustment, invalidatedSeal: seal || null, clock: clockSummary(db, clock) });
   }
 
   const retestMatch = pathname.match(/^\/clocks\/([^/]+)\/retests$/);
@@ -229,6 +287,49 @@ async function handle(req, res) {
     return send(res, 201, { data: retest, clock: clockSummary(db, clock) });
   }
 
+  const sealMatch = pathname.match(/^\/clocks\/([^/]+)\/seal$/);
+  if (sealMatch && req.method === "POST") {
+    const clock = findClock(db, sealMatch[1]);
+    const body = await parseBody(req);
+    required(body, ["deliveredBy", "sealTag"]);
+    const active = activeSeal(db, clock.id);
+    if (active) {
+      const error = new Error(`钟表已封存（封签 ${active.sealTag}），再次调校前不能重复封存`);
+      error.status = 409;
+      throw error;
+    }
+    const eligibility = sealEligibility(db, clock);
+    if (!eligibility.ok) {
+      const reason = eligibility.reason === "pending_retest"
+        ? "当前调校后尚无复测记录，钟表处于待复测状态"
+        : `最新复测未达标（日差 ${eligibility.retest.dailyRateSeconds}s / 目标 ±${clock.targetDailyRateSeconds}s，振幅 ${eligibility.retest.amplitude}° / 要求 ${AMPLITUDE_MIN}–${AMPLITUDE_MAX}°）`;
+      const error = new Error(`${reason}，不能登记封存`);
+      error.status = 409;
+      throw error;
+    }
+    // 封签全局唯一（含已失效封存），重复直接 409 且不写入
+    if (db.seals.some((item) => item.sealTag === body.sealTag)) {
+      const error = new Error(`封签 ${body.sealTag} 已存在，封存登记被拒绝`);
+      error.status = 409;
+      throw error;
+    }
+    const seal = {
+      id: makeId("seal"),
+      clockId: clock.id,
+      sealTag: body.sealTag,
+      deliveredBy: body.deliveredBy,
+      retestId: eligibility.retest.id,
+      sealedAt: new Date().toISOString(),
+      status: "active",
+      invalidatedAt: null,
+      invalidatedByAdjustmentId: null,
+      note: body.note || ""
+    };
+    db.seals.push(seal);
+    await writeDb(db);
+    return send(res, 201, { data: seal, clock: clockSummary(db, clock) });
+  }
+
   const latestMatch = pathname.match(/^\/clocks\/([^/]+)\/latest-retest$/);
   if (latestMatch && req.method === "GET") {
     findClock(db, latestMatch[1]);
@@ -248,6 +349,21 @@ async function handle(req, res) {
       const matchQualified = qualified === null || item.qualified === (qualified === "true");
       return matchClock && matchQualified;
     });
+    return send(res, 200, { data });
+  }
+
+  const detailMatch = pathname.match(/^\/clocks\/([^/]+)$/);
+  if (detailMatch && req.method === "GET") {
+    const clock = findClock(db, detailMatch[1]);
+    return send(res, 200, { data: clockSummary(db, clock) });
+  }
+
+  if (req.method === "GET" && pathname === "/seals") {
+    const clockId = url.searchParams.get("clockId");
+    const status = url.searchParams.get("status");
+    const data = db.seals
+      .filter((item) => (!clockId || item.clockId === clockId) && (!status || item.status === status))
+      .sort((a, b) => new Date(b.sealedAt) - new Date(a.sealedAt));
     return send(res, 200, { data });
   }
 
